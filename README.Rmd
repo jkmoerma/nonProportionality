@@ -1,0 +1,632 @@
+---
+title: "Non-proportionality and hypothesis testing in survival analysis: a simulation experiment"
+author: "Jef Moerman"
+date: "2025-09-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(knitr)
+library(doParallel)
+library(dplyr)
+library(foreach)
+library(parallel)
+library(survival)
+library(ggplot2)
+library(gridExtra)
+
+draw_who <- function(incperiod) {
+  stopifnot(incperiod%in% c("2010-2013", "2014-2017", "2018-2021"))
+  states <- c("0 – Asymptomatic",
+              "1 – Symptomatic but completely ambulatory",
+              "2 – Symptomatic, <50% in bed during the day",
+              "3 – Symptomatic, >50% in bed, but not bedbound",
+              "4 – Bedbound",
+              "Missing")
+  if (incperiod %in% c("2010-2013", "2014-2017")) {
+    sample(states, size=1, prob=c(0.04, 0.7, 0.09, 0.05, 0.02, 0.1))
+  } else {
+    sample(states, size=1, prob=c(0.14, 0.65, 0.07, 0.02, 0.02, 0.1))
+  }
+}
+
+draw_cStage <- function(incperiod) {
+  stopifnot(incperiod%in% c("2010-2013", "2014-2017", "2018-2021"))
+  stages <- c("0", "I", "II", "III", "IV", "Ongekend")
+  if (incperiod %in% c("2010-2013", "2014-2017")) {
+    sample(stages, size=1, prob=c(0.5, 0.5, 1, 1.5, 1.5, 1)/6)
+  } else {
+    sample(stages, size=1, prob=c(1.2, 1.2, 0.87, 0.87, 0.86, 1)/6)
+  }
+}
+
+draw_time <- function(agegr_vec, comorb1_vec, who_vec, cStage_vec, effect=NULL) {
+
+  if (is.null(effect)) {
+    who_effect <- TRUE
+    cStage_effect <- TRUE
+  } else {
+    if (effect=="cStage") {who_effect <- FALSE; cStage_effect <- TRUE}
+    if (effect=="who") {who_effect <- TRUE; cStage_effect <- FALSE}
+  }
+  
+  n <- length(agegr_vec)
+  if (n==0) {
+    return(NULL)
+  }
+  agegr <- unique(agegr_vec)
+  comorb1 <- unique(comorb1_vec)
+  who <- unique(who_vec)
+  cStage <- unique(cStage_vec)
+
+  # we set the baseline hazard so that a person <50j without comorbidity,
+  # who stage asymptomatic and cStage 0 has 99% survival for 3 years (time flag 360)
+
+  log_lambda <- rep(log(1-0.99**(1/360)), 500)
+
+  # agegr and comorb1 risk dependencies can be modelled as proportional to a baseline
+  # two-fold increase in risk for 80+j patients compared to <50j patients
+  
+  log_lambda <- log_lambda + log(0.75 + 0.25*as.numeric(agegr))
+  
+  # 20% increased risk for patients with comorb1
+  
+  log_lambda <- log_lambda + log(1.2)*comorb1
+
+  # Who score must display exponential schoenfeld residuals with a relaxation
+  # time of 1 year (120 time stamps)
+  
+  if (who_effect) {
+    who_effects <- data.frame(score = c("0 – Asymptomatic",
+                                      "1 – Symptomatic but completely ambulatory",
+                                      "2 – Symptomatic, <50% in bed during the day",
+                                      "3 – Symptomatic, >50% in bed, but not bedbound",
+                                      "4 – Bedbound",
+                                      "Missing"),
+                            beta = c(0, log(3), log(6), log(9), log(20), log(3.5)))
+    who_effect <- subset(who_effects, subset = score==who)$beta
+    log_lambda <- log_lambda + who_effect * exp(seq(from=0, to=-500/120, length.out=500))
+  }
+
+  # cStage has linearly increasing schoenfeld residuals
+  
+  if (cStage_effect) {
+    log_lambda <- log_lambda + (as.numeric(cStage)-1)**2 * seq(from=0, to=(500/360)*log(5)/16, length.out=500)
+  }
+
+  
+  # we now convert log-lambda to probability of selecting a certain timestamp
+
+  lambda <- exp(log_lambda)
+  risks <- 1-exp(-lambda)
+  freqs <- cumprod(1-risks)
+  probs <- risks*freqs
+  probs <- probs/sum(probs)
+
+  # we can now attribute timestamps with weighted sampling (unit: years)
+
+  return(sample(x=(1:500)/120, size=n, replace=TRUE, prob=probs))
+
+}
+
+simulate_data <- function(seed, effect=NULL) {
+  set.seed(seed)
+
+  OS_sim <- data.frame(incperiod=factor(rep(c("2010-2013", "2014-2017", "2018-2021"),
+                                            each=1334),
+                                        labels=c("2010-2013", "2014-2017", "2018-2021")))
+  OS_sim$fld_sx <- factor(sample(c("Mannen", "Vrouwen"), size=4002, replace=TRUE),
+                          labels=c("Mannen", "Vrouwen"))
+  OS_sim$agegr <- factor(sample(c("<50j", "50j-59j", "80+j", "70j-79j", "60j-69j"),
+                                size=4002,
+                                replace=TRUE,
+                                prob=c(0.1, 0.2, 0.1, 0.2, 0.4)),
+                         labels=c("<50j", "50j-59j", "60j-69j", "70j-79j", "80+j"))
+  OS_sim$comorb1 <- sample(0:1, size=4002, replace=TRUE, prob=c(0.9, 0.1))
+  OS_sim$comorb2 <- sample(0:1, size=4002, replace=TRUE, prob=c(0.7, 0.3))
+  OS_sim$comorb3 <- sample(0:1, size=4002, replace=TRUE, prob=c(0.8, 0.2))
+
+  OS_sim <- OS_sim %>% rowwise() %>% mutate(who=draw_who(incperiod))
+  OS_sim <- OS_sim %>% rowwise() %>% mutate(cStage=draw_cStage(incperiod))
+  OS_sim$cStage <- factor(OS_sim$cStage, labels=c("0", "I", "II", "III", "IV", "Ongekend"))
+
+  OS_sim %>%
+    group_by(agegr, comorb1, who, cStage) %>%
+    mutate(surv_yy3 = draw_time(agegr, comorb1, who, cStage, effect=effect),
+           status3 = as.numeric(surv_yy3 < 3)) %>%
+    rowwise() %>%
+    mutate(surv_yy3 = min(surv_yy3, 3))   # administrative censoring after 3 years
+}
+
+calculate_pvals <- function(niter, effect=NULL) {
+  ncores <- detectCores()
+
+  cl <- makeCluster(detectCores() - 1)
+  registerDoParallel(cl)
+
+  res <- foreach(i=1:niter,
+                 .combine=bind_rows,
+                 .export=c("draw_who", "draw_cStage", "draw_time", "simulate_data", "effect"),
+                 .packages=c("survival", "dplyr")) %dopar% {
+                   OS <- simulate_data(i, effect=effect)
+                   cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage,
+                                      data = OS,
+                                      ties = "breslow")
+
+                   beta_coefficients <- summary(cox_model)$coefficients[c("incperiod2014-2017", "incperiod2018-2021"),
+                                                                        c("coef", "se(coef)", "Pr(>|z|)")]
+                   return(data.frame(period = rownames(beta_coefficients),
+                                     coef = beta_coefficients[, 'coef'],
+                                     SE = beta_coefficients[, 'se(coef)'],
+                                     pval = beta_coefficients[, 'Pr(>|z|)'],
+                                     iter = i))
+                 }
+
+  stopCluster(cl)
+
+  res
+}
+
+
+```
+
+# Introduction
+
+This document was established to further reflect on an analysis performed for the National Cancer Registre. As a part of their recruitement procedure for a statistician, the candidates were given a data set to assess whether the incidence period (`incperiod`: 2010-2013, 2014-2017, 2018-2021) was a determining factor for the survival of newly diagnosed cancer patients. This data consisted of data corrected for factors:
+
+* gender (`fld_sx`)    
+* age (`agegr`)     
+* some comorbidities (`comorb1`, `comorb2`, `comorb3`)   
+* symptoms at diagnosis (`who`)     
+* cancer stage (`cStage`)  
+
+The follow-up of patients was 3 years, after which they were administratively censored
+
+* survival time was named as: `surv_yy3`  
+* event indicator was named as: `status3`
+
+Because of data ownership, the presentation was confidential and could not be shared with third parties. This reason was the inspiration to make a simulation study to further question my inference made from the received data. 
+
+I reproduced a data set with similar dynamics as the received data, without using estimated parameters of the received data but rather selecting parameters more or less reflecting the dynamics of the received data. 
+
+On my presentation, I fitted a Cox proportional hazards model on data where the variable of interest did obey the proportional hazards assumption, but some variables did not. From this I want to adress two concerns with the analysis:
+
+* how does non-proportionality with a known functional dependence present itself in the Schoenfeld residuals
+* how reliable is the Wald test for the effect of the incidence period?
+
+In the rest of this article, I discuss:
+
+* the dynamics of the simulated data
+* the Schoenfeld residuals of a cox model fitted on these data
+* an iterative resampling experiment and its p-value distribution
+
+
+
+# Data simulation
+
+## Simulating covariates
+
+My simulation experiment consists of 4002 patients equally distributed across the three incidence periods 2010-2013, 2014-2017 and 2018-2021 (1334 per period).
+I wanted to reproduce data in which some covariates were independent of the other variables and some were dependent. Following covariates were randomly sampled independent of other predictor variables:
+
+* gender (`fld_sx`)    
+* age (`agegr`)     
+* comorbidity (`comorb1`) (`comorb2`, `comorb3` are not present in my simulation)
+
+To make the data more complex, I decided to make `incperiod` associated with factors:
+
+* cancer stage at diagnosis (`cStage`)
+* who score at diagnosis (`who`)
+
+To reflect improved screening management in my simulation, the incidence period 2018-2021 has another distribution of these two variables than incidence periods 2010-2013 and 2014-2017.
+
+
+## Simulating survival times
+
+To simulate survival times, I used weighted sampling of survival times on a time grid of 500 time stamps. I chose time stamp 360 as the three year survival mark, allowing administrative censoring for sim-patients that survived longer than the follow-up time
+
+My sampling technique consisted of the following steps:
+
+1. $log(\lambda)_i$: calculate log-lambda for a patient with given covariates at every timestamp $i$
+2. $\lambda_i = \exp{(log(\lambda)_i)}$: exponentiate this log-lambda to obtain risks of an event at every timestamp $i$
+3. $r_i = 1-\exp{(-\lambda_i)}$: correction in order to not obtain risks larger than 1
+4. $f_i = \prod_{j=1}^{i} (1-r_i)$: calculate the relative frequencies of a cohort of patients with the same covariates
+5. $p_i = f_i \times r_i$: the probability of having an event on timestamp $i$ is the risk of an event multiplied by the relative frequency of the remainder of the cohort of identical patients
+
+Variables that obeyed proportionality (gender, age and comorbidity) were introduced in the survival time simulation as:
+$$\log{\lambda}(var) \sim \log{\lambda_0} + \beta_{var}  $$
+
+Non-proportionality for cancer stage and WHO score was introduced by generating log-lambda values altering at every time stamp. The effect of cancer stage at diagnosis was modeled as a linearly increasing effect of time:
+$$\log{\lambda}(cStage) \sim \log{\lambda_0} + \beta_{cStage} \times t $$
+The effect of WHO score was modeled as an effect exponentially decaying with time. The chosen relaxation time was 1 year:
+$$\log{\lambda}(who) \sim \log{\lambda_0} + \beta_{who} \times \exp{(-t/\, y)} $$
+
+
+# Schoenfeld residuals
+
+Having `who` and `cStage` as predictors with more than two categories, I wanted to disentangle the dynamics of the Schoenfeld residuals of a Cox model trained on a subset of the data containing only the baseline category and one of the other categories.
+
+For this paragraph, two data sets were generated with survival times dependent on the other covariates and either `who` or `cStage`, suppressing the effect of one of the two on the survival times. This step was undertaken because `who` and `cStage` are both dependent on `incperiod` and therefore correleted with each other. Suppressing the effect of one covariate leaves a possibility to clearly examine the effect of the other covariate
+
+For each of the two data sets the following steps were undertaken:
+
+1. filter data set on baseline level ("0 – Asymptomatic" for `who` and "0" for `cStage`) and one of the other levels
+2. train Cox proportional hazards model on covariates `incperiod`, `who` and `cStage`
+3. calculate the expected functional form of the Schoenfeld residuals with respect to survival time
+4. plot Schoenfeld residuals against time, add a locally weighted average and the expected functional dependence
+
+By performing this investigation, a view is generated of how the Schoenfeld residuals and their functional time dependence present of one two-level covariate, without confounding of the other levels of the variable or by other covariates.
+
+## Isolated effects of `who`
+
+Schoenfeld residuals of models trained on the different subsets of `who` and a model trained on the whole synthetic data set.
+
+```{r echo=FALSE}
+OS <- simulate_data(0, effect="who")
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = who %in% c("0 – Asymptomatic", 
+                                                         "1 – Symptomatic but completely ambulatory")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,2]) %>%
+             mutate(functional_form=0.3*exp(-time))
+p1 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="'0 – Asymptomatic' \n versus \n '1 – Symptomatic but completely ambulatory'")
+
+
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = who %in% c("0 – Asymptomatic", 
+                                                         "2 – Symptomatic, <50% in bed during the day")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,2]) %>%
+             mutate(functional_form=exp(-time))
+p2 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="'0 – Asymptomatic' \n versus \n '2 – Symptomatic, <50% in bed during the day'")
+
+
+
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = who %in% c("0 – Asymptomatic", 
+                                                         "3 – Symptomatic, >50% in bed, but not bedbound")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,2]) %>%
+             mutate(functional_form=2*exp(-time))
+p3 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="'0 – Asymptomatic' \n versus \n '3 – Symptomatic, >50% in bed, but not bedbound'")
+
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = who %in% c("0 – Asymptomatic", 
+                                                         "4 – Bedbound")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,2]) %>%
+             mutate(functional_form=2*exp(-time))
+p4 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="'0 – Asymptomatic' \n versus \n '4 – Bedbound'")
+
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = OS,
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,2]) %>%
+             mutate(functional_form=3*exp(-time))
+ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res), se = TRUE) +
+  labs(y="Schoenfeld residuals", title="All WHO score levels")
+
+
+```
+
+
+## Isolated effects of `cStage`
+
+Schoenfeld residuals of models trained on the different subsets of `cStage` and a model trained on the whole synthetic data set. A Simpson's paradox clearly appears in the all-level combined time dependence of the Schoenfeld residuals. 
+
+```{r echo=FALSE}
+OS <- simulate_data(0, effect="cStage")
+
+layout(mat=matrix(1:4, byrow=TRUE))
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = cStage %in% c("0", "I")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,3]) %>%
+             mutate(functional_form=(log(5)/16)*time/3)
+p1 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="Stage '0' versus Stage 'I'")
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = cStage %in% c("0", "II")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,3]) %>%
+             mutate(functional_form=4*(log(5)/16)*time/3)
+p2 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="Stage '0' versus Stage 'II'")
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = cStage %in% c("0", "III")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,3]) %>%
+             mutate(functional_form=9*(log(5)/16)*time/3)
+p3 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="Stage '0' versus Stage 'III'")
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = subset(OS, subset = cStage %in% c("0", "IV")),
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,3]) %>%
+             mutate(functional_form=16*(log(5)/16)*time/3)
+p4 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res, colour="func. dep."), se = TRUE) +
+  geom_line(aes(x=time, y=functional_form, colour="exp. dep.")) + 
+  scale_colour_manual("", 
+                      breaks = c("func. dep.", "exp. dep."),
+                      values = c("blue", "orange")) +
+  labs(y="Schoenfeld residuals", title="Stage '0' versus Stage 'IV'")
+
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = OS,
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+#signif(proportionality$table, digits=3)
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,3])
+ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res), se = TRUE) +
+  labs(y="Schoenfeld residuals", title="All cancer stages")
+
+
+```
+
+
+
+# Mixed-case Cox PH model (`who` and `cStage`)
+
+After an examination of the isolated Schoenfeld residuals of `who` and `cStage` we have more insight in how modeled effects present in them. I wanted to understand how the Cox model and the Schoenfeld residuals behave in a mixed-case data set.
+
+I present in the regression coefficients for incidence period of a model with proportional main effects only, as has been the case for examining the residuals. Additionally, the results of a test for proportionality is included.
+
+
+```{r echo=FALSE}
+OS <- simulate_data(0)
+cox_model <- coxph(Surv(surv_yy3, status3) ~ incperiod + who + cStage, 
+                   data = OS,
+                   ties = "exact")
+proportionality <- cox.zph(cox_model, terms=TRUE, singledf=FALSE)
+kable(signif(proportionality$table, digits=3))
+
+```
+
+
+```{r echo=FALSE, fig.height=12}
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,1],
+                      functional_form = 0)
+p1 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res), se = TRUE) +
+  labs(y="Schoenfeld residuals", title="Incidence period")
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,2])
+p2 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res), se = TRUE) +
+  labs(y="Schoenfeld residuals", title="WHO score at diagnosis")
+
+who_res <- data.frame(time = proportionality$time,
+                      res = proportionality$y[,3])
+p3 <- ggplot(who_res, aes(x=time, y=res)) + 
+  geom_point(aes(x=time, y=res)) +
+  geom_smooth(aes(x=time, y=res), se = TRUE) +
+  labs(y="Schoenfeld residuals", title="Cancer stage at diagnosis")
+
+grid.arrange(p1, p2, p3, ncol = 1)
+
+```
+
+
+# Distribution of the Wald p-values for `incperiod`
+
+An exact test is a test that controls the type I error rate. This is equivalent to stating that the p-values of repeated sampling are uniformly distributed. For 1000 repeated experiments, a histogram was made of the Wald p-values to inspect the implications of the non-proportional confounding variables on hypothesis testing for the beta-coefficients of variable `incperiod` (incidence period). 
+
+```{r echo=FALSE}
+pvals <- calculate_pvals(1000)
+hist(subset(pvals, subset = period=="incperiod2014-2017")$pval, 
+     main="incidence period 2014-2017",
+     xlab="Wald p-value")
+hist(subset(pvals, subset = period=="incperiod2018-2021")$pval, 
+     main="incidence period 2018-2021",
+     xlab="Wald p-value")
+
+```
+
+
+# Conclusion
+
+The functional form of the time-dependend log-hazard can be found in the functional form of the Schoenfeld residuals. This finding is applicable for two-level categorical predictors. The time dependence of covariates with more than two levels can be misleading when inspecting the Schoenfeld residuals of a Cox proportional hazards model. In the example given, cancer stage clearly showed a Simpson's paradox, giving a false impression that over time, the effect of cancer stage on survival declines, while in the simulation the effect increases.
+
+Despite strong deviations from proportionality, the Wald test remained exact for hypothesis testing of `incperiod`. Further research on this finding can be performed on:
+
+* the power of an alternative hypothesis, in which one of the incidence periods was given an inherent effect on survival
+* further investigating the Wald test under the null hypothesis, but with stronger violations of the proportionality assumption
+
+
+
+# Appendix: observed variable distribution
+
+```{r echo=FALSE}
+p1 <- ggplot(data=OS, aes(x=fld_sx, fill=fld_sx)) + 
+        geom_bar() + 
+        labs(title="Gender distribution", xlab="") +
+        theme(legend.title = element_blank(), 
+              legend.position="none")
+
+p2 <- ggplot(data=OS, aes(x=who, fill=who)) + 
+        geom_bar() + 
+        labs(title="WHO score distribution", xlab="") +
+        theme(legend.title=element_blank(), 
+              legend.position="none", 
+              axis.text.x=element_text(angle=45, hjust=1, vjust=1))
+
+p3 <- ggplot(data=OS, aes(x=surv_yy3, fill=factor(status3))) + 
+        labs(title="Observed survival times") +
+        geom_histogram(position="stack", bins=15)
+
+p4 <- ggplot(data=OS, aes(x=factor(status3), fill=factor(status3))) + 
+        geom_bar() + 
+        labs(title="Survival status at endpoint", x="status3") +
+        theme(legend.title = element_blank(), legend.position="none")
+
+p5 <- ggplot(data=OS, aes(x=agegr, fill=agegr)) + 
+        geom_bar() + 
+        labs(title="Age group distribution", xlab="") +
+        theme(legend.title=element_blank(), 
+              legend.position="none", 
+              axis.text.x=element_text(angle=45, hjust=1, vjust=1))
+
+p6 <- ggplot(data=OS, aes(x=incperiod, fill=incperiod)) + 
+        geom_bar() + 
+        labs(title="Incidence period distribution", xlab="") +
+        theme(legend.title=element_blank(), 
+              legend.position="none", 
+              axis.text.x=element_text(angle=45, hjust=1, vjust=1))
+
+p7 <- ggplot(data=OS, aes(x=cStage, fill=cStage)) + 
+        geom_bar() + 
+        labs(title="Cancer stage distribution", xlab="") +
+        theme(legend.title=element_blank(), legend.position="none")
+
+p8 <- ggplot(data=OS, aes(x=factor(comorb1), fill=factor(comorb1))) + 
+        geom_bar() + 
+        labs(title="Comorbidity 1 distribution", xlab="comorb1") +
+        theme(legend.title=element_blank(), legend.position="none")
+
+p9 <- ggplot(data=OS, aes(x=factor(comorb2), fill=factor(comorb2))) + 
+        geom_bar() + 
+        labs(title="Comorbidity 2 distribution", xlab="comorb2") +
+        theme(legend.title=element_blank(), legend.position="none")
+
+p10 <- ggplot(data=OS, aes(x=factor(comorb3), fill=factor(comorb3))) + 
+         geom_bar() + 
+         labs(title="Comorbidity 3 distribution", xlab="comorb3") +
+         theme(legend.title=element_blank(), legend.position="none")
+
+```
+
+```{r echo=FALSE, fig.width=6}
+grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r echo=FALSE, fig.width=6}
+grid.arrange(p3, p4, p5, p6, ncol = 2)
+
+```
+
+```{r echo=FALSE, fig.width=6}
+grid.arrange(p7, p8, p9, p10, ncol = 2)
+
+```
+
+
+
+
+
+
+
+
+
+
